@@ -1,0 +1,408 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <WebSocketsServer.h>
+#include "driver/i2s.h"
+
+#define NetN  "Alexa"
+#define NetP  "Tanongmokaymama"
+
+AsyncWebServer server(80);
+WebSocketsServer wsServer(81);
+
+// Global variables for random latitude and longitude
+double latitude = NAN;
+double longitude = NAN;
+
+// I2S microphone pins and config
+#define I2S_WS  2
+#define I2S_SD  4
+#define I2S_SCK 15
+#define I2S_PORT I2S_NUM_0
+
+#define SAMPLE_RATE 16000
+#define I2S_BUF_LEN 512
+
+uint8_t i2s_buffer[I2S_BUF_LEN];
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GPS tracking</title>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+
+    <style>
+        body { 
+            font-family: kigelia, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background-color: #f3f6f4; 
+        }
+        .grid { 
+            display: grid; 
+            grid-template-columns: repeat(2, 1fr); 
+            gap: 20px; 
+            max-width: 1200px; 
+            margin: 0 auto; 
+        }
+
+        .card { 
+            background: white; 
+            border-radius: 15px; 
+            padding: 25px; 
+            box-shadow: 0 4px 8px rgba(0,0,0,0.5); 
+            display: flex; 
+            align-items: center; 
+            text-align: left; 
+        }
+        
+        button.mic {
+            margin-top: 15px;
+            align-self: flex-start;
+            padding: 15px 30px;
+            font-size: 16px;
+            background-color: #caa63d; 
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.2s;
+        }
+        button.mic:hover {
+            background-color: #795f13;
+            transform: scale(1.1);
+        }
+        
+        button.map{
+            margin-top: 7px;
+            align-self: flex-start;
+            padding: 10px 30px;
+            font-size: 16px;
+            background-color: #388e3c; 
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.2s;
+        }
+        button.map:hover {
+            background-color: #1b5e20;
+            transform: scale(1.1);
+        }
+
+        .iconp { 
+            font-size: 100px; 
+            margin-right: 25px; 
+            min-width: 50px; 
+            text-align: center; 
+        }
+        
+        .iconm {
+            font-size: 60px;
+            color: #404040;
+            margin-right: 25px;
+            min-width: 50px;
+            text-align: center;
+        }
+
+        .content { 
+            display: flex; 
+            flex-direction: column; 
+        }
+
+        .label { 
+            font-size: 20; 
+            color: #7f8c8d; 
+            margin-bottom: 5px; 
+            font-weight: bold; 
+        }
+        
+        .dlabel {
+            font-size: 20;
+            color: #7f8c8d;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        .value { 
+            font-size: 25px; 
+            color: #2c3e50; 
+            display: flex; 
+            align-items: baseline; 
+            font-weight: bold;
+        }
+        
+        .dvalue {
+            font-size: 25px; 
+            color: #2c3e50; 
+            display: flex; 
+            align-items: baseline; 
+        }
+        
+        .unit { 
+            font-size: 16px; 
+            color: #95a5a6; 
+            margin-left: 5px; 
+        }
+
+        h1 { 
+            text-align: center; 
+            font-family: courier; 
+            margin: 30px 0; 
+            color: #484848; 
+        }
+
+    </style>
+
+    <script>
+      function updateData() {
+        var xhttp = new XMLHttpRequest();
+        xhttp.onreadystatechange = function() {
+            if (this.readyState == 4 && this.status == 200) {
+              var data = JSON.parse(this.responseText);
+              document.getElementById('lat1').textContent = data.lat;
+              document.getElementById('lng1').textContent = data.lng;
+
+              // Person2, Person3 placeholders
+              document.getElementById('lat2').textContent = "-";
+              document.getElementById('lng2').textContent = "-";
+              document.getElementById('lat3').textContent = "-";
+              document.getElementById('lng3').textContent = "-";
+            }
+        };
+        xhttp.open("GET", "/data", true);
+        xhttp.send();
+      }
+      setInterval(updateData, 2000);
+      window.onload = updateData;
+      
+      function openGoogleMaps(latId, lngId) {
+        var lat = document.getElementById(latId).textContent.trim();
+        var lng = document.getElementById(lngId).textContent.trim();
+        if(lat === "-" || lng === "-") {
+          alert("location coords unavailable...");
+          return;
+        }
+        var url = `https://www.google.com/maps?q=${encodeURIComponent(lat)},${encodeURIComponent(lng)}`;
+        window.open(url, '_blank');
+      }
+
+      let ws;
+      let audioContext;
+      let streaming = false;
+      let lastMicBtn = null;
+
+      function toggleMicStream(button) {
+        if (!streaming) {
+          startMicStream();
+          button.textContent = 'Stop Microphone';
+          lastMicBtn = button;
+        } 
+        
+        else {
+          stopMicStream();
+          if (lastMicBtn) lastMicBtn.textContent = 'Microphone';
+          lastMicBtn = null;
+        }
+        streaming = !streaming;
+      }
+
+      function startMicStream() {
+        ws = new WebSocket('ws://' + location.hostname + ':81/');
+        ws.binaryType = 'arraybuffer';
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+        ws.onmessage = function(event) {
+          let int16Array = new Int16Array(event.data);
+          let floatArray = new Float32Array(int16Array.length);
+          for (let i = 0; i < int16Array.length; i++) {
+            floatArray[i] = int16Array[i]/32767;
+          }
+          let audioBuffer = audioContext.createBuffer(1, floatArray.length, 16000);
+          audioBuffer.getChannelData(0).set(floatArray);
+          let source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(audioContext.destination);
+          source.start();
+        };
+      }
+
+      function stopMicStream() {
+        if (ws) ws.close();
+        ws = null;
+        if (audioContext) audioContext.close();
+        audioContext = null;
+      }
+    </script>
+
+</head>
+
+<body>
+    <h1>GPS tracking</h1>
+    <div class="grid">
+
+        <div class="card">
+            <i class="fa-solid fa-user iconp" style="color: #6fa8dc;"></i>
+            <div class="content">
+                <div class="value" title="additional info here";>Person1:</div>
+                <div class="dlable" title="additional info here";>phone number:</div>
+                <button class="mic" type="button" onclick="toggleMicStream(this)" title="open microphone">Microphone</button>
+           </div>        
+        </div>
+        <div class="card">
+            <i class="fa-solid fa-map-location-dot iconm" style="color: #073763;"></i>
+            <div class="content">
+                <div class="label">Latitude</div>
+                <div class="dvalue" id="lat1">%LAT%</div>
+                <div class="label">Longitude</div>
+                <div class="dvalue" id="lng1">%LNG%</div>
+                <button class="map" type="button" onclick="openGoogleMaps('lat1', 'lng1')" title="open Google Maps">View on Map</button>
+            </div>
+        </div>
+        
+        <div class="card">
+            <i class="fa-solid fa-user iconp" style="color:#93c47d;"></i>
+             <div class="content">
+                <div class="value" title="additional info here";>Person2:</div>
+                <div class="dlable" title="additional info here";>phone number:</div>
+                <button class="mic" type="button" onclick="toggleMicStream(this)" title="open microphone">Microphone</button>
+           </div>        
+        </div>
+        <div class="card">
+            <i class="fa-solid fa-map-location-dot iconm" style="color: #274e13;"></i>
+            <div class="content">
+                <div class="label">Latitude</div>
+                <div class="value" id="lat2">-</div>
+                <div class="label">Longitude</div>
+                <div class="value" id="lng2">-</div>
+                <button class="map" type="button" onclick="openGoogleMaps('lat2', 'lng2')" title="open Google Maps">View on Map</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <i class="fa-solid fa-user iconp" style="color:#e06666;"></i>
+            <div class="content">
+                <div class="value" title="additional info here";>Person3:</div>
+                <div class="dlable" title="additional info here";>phone number:</div>
+                <button class="mic" type="button" onclick="toggleMicStream(this)" title="open microphone">Microphone</button>
+           </div>        
+        </div>
+        <div class="card">
+            <i class="fa-solid fa-map-location-dot iconm" style="color: #660000;"></i>
+            <div class="content">
+                <div class="label">Latitude</div>
+                <div class="value" id="lat3">-</div>
+                <div class="label">Longitude</div>
+                <div class="value" id="lng3">-</div>
+                <button class="map" type="button" onclick="openGoogleMaps('lat3', 'lng3')" title="open Google Maps">View on Map</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+)rawliteral";
+
+String processor(const String& var) {
+  if (var == "LAT") {
+    if (isnan(latitude)) {
+       return "Waiting for signal...";
+    } else {
+      return String(latitude, 6);
+    }
+  }
+  else if (var == "LNG") {
+    if (isnan(longitude)) {
+       return "Waiting for signal...";
+    } else {
+      return String(longitude, 6);
+    }
+  }
+  return String();
+}
+
+void i2sInit() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = -1,
+    .data_in_num = I2S_SD
+  };
+
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+  i2s_zero_dma_buffer(I2S_PORT);
+}
+
+void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if(type == WStype_CONNECTED)
+    Serial.printf("WebSocket client #%u connected\n", num);
+  else if(type == WStype_DISCONNECTED)
+    Serial.printf("WebSocket client #%u disconnected\n", num);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(NetN, NetP);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html, processor);
+  });
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    String latStr = isnan(latitude) ? "Waiting for signal..." : String(latitude, 6);
+    String lngStr = isnan(longitude) ? "Waiting for signal..." : String(longitude, 6);
+    String json = "{\"lat\":\"" + latStr + "\",\"lng\":\"" + lngStr + "\"}";
+    request->send(200, "application/json", json);
+  });
+
+  server.begin();
+
+  wsServer.begin();
+  wsServer.onEvent(onWsEvent);
+
+  i2sInit();
+
+  // Initialize random seed using an analog pin (floating)
+  randomSeed(analogRead(0));
+}
+
+void loop() {
+  wsServer.loop();
+
+  size_t bytes_read;
+  i2s_read(I2S_PORT, (void*)i2s_buffer, I2S_BUF_LEN, &bytes_read, portMAX_DELAY);
+  if(bytes_read > 0)
+    wsServer.broadcastBIN(i2s_buffer, bytes_read);
+
+  // Generate random latitude and longitude for demo
+  latitude = random(-90000000, 90000000) / 1000000.0;
+  longitude = random(-180000000, 180000000) / 1000000.0;
+
+  delay(1000);
+}
